@@ -1,0 +1,25 @@
+name: CI
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: alpine:3.20
+    steps:
+      - uses: actions/checkout@v4
+      - run: apk add --no-cache gcc musl-dev make
+      - run: make
+      - run: ./test_ssort
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: tar czf ssort-${{ github.ref_name }}.tar.gz LICENSE README.md ssort.h ssort.c Makefile
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ssort-${{ github.ref_name }}.tar.gz
