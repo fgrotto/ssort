@@ -9,12 +9,21 @@ jobs:
       - uses: actions/checkout@v4
       - run: apk add --no-cache gcc musl-dev make
       - run: make
-      - run: ./test_ssort
+      - run: make fuzz
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    container: debian:trixie-slim
+    steps:
+      - uses: actions/checkout@v4
+      - run: apt-get update && apt-get install -y --no-install-recommends gcc make libc6-dev
+      - run: make asan
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
+    container: alpine:3.20
     permissions:
       contents: write
     steps:

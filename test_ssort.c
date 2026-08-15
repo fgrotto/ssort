@@ -344,6 +344,114 @@ TEST(test_medium_random) {
     ssort_graph_free(g);
 }
 
+/* ─── BMSSP-path tests (n >= 256 exercises the n>=256 algorithm) ── */
+
+static void check_pred_path(const SsortGraph *g, int src, const double *ds,
+                            const int *pred) {
+    LCSR c; lcsr_build(&c, g);
+    for (int i = 0; i < c.n; i++) {
+        if (ds[i] == SSORT_INFINITY) continue;
+        if (i == src) { ASSERT(pred[i] == -1); continue; }
+        ASSERT(pred[i] >= 0 && pred[i] < c.n);
+        /* dist[pred[i]] + w(pred[i],i) == dist[i] must hold */
+        int p = pred[i], ok = 0;
+        for (int e = c.off[p]; e < c.off[p+1]; e++)
+            if (c.adj[e] == i && fabs(ds[p] + c.wgt[e] - ds[i]) < 1e-9)
+                ok = 1;
+        ASSERT(ok);
+    }
+    lcsr_free(&c);
+}
+
+TEST(test_bmssp_chain2) {
+    /* n=257 linear chain with unit weights: equal-label relaxations must
+       propagate through the BMSSP path. */
+    int n = 257;
+    SsortGraph *g = ssort_graph_new(n, n - 1);
+    for (int i = 0; i < n - 1; i++) ssort_graph_add_edge(g, i, i + 1, 1.0);
+    double *ds = malloc(sizeof(double) * n);
+    double *dd = malloc(sizeof(double) * n);
+    int *pred = malloc(sizeof(int) * n);
+    ssort(g, 0, ds, pred);
+    ref_dijkstra(g, 0, dd);
+    compare_all(g, ds, dd, dd);
+    ASSERT(ds[n - 1] == (double)(n - 1));
+    check_pred_path(g, 0, ds, pred);
+    free(ds); free(dd); free(pred);
+    ssort_graph_free(g);
+}
+
+TEST(test_bmssp_shortcut) {
+    /* n=3000 with a short-cut path (0->2->3->1, w1) beating the direct
+       edge 0->1 (w10): the BMSSP path must return d[1]=3, d[3]=2. */
+    int n = 3000;
+    SsortGraph *g = ssort_graph_new(n, 4);
+    ssort_graph_add_edge(g, 0, 1, 10.0);
+    ssort_graph_add_edge(g, 0, 2, 1.0);
+    ssort_graph_add_edge(g, 2, 3, 1.0);
+    ssort_graph_add_edge(g, 3, 1, 1.0);
+    double *ds = malloc(sizeof(double) * n);
+    double *dd = malloc(sizeof(double) * n);
+    int *pred = malloc(sizeof(int) * n);
+    ssort(g, 0, ds, pred);
+    ref_dijkstra(g, 0, dd);
+    compare_all(g, ds, dd, dd);
+    ASSERT(ds[1] == 3.0);
+    ASSERT(ds[3] == 2.0);
+    check_pred_path(g, 0, ds, pred);
+    free(ds); free(dd); free(pred);
+    ssort_graph_free(g);
+}
+
+TEST(test_bmssp_zero_weight) {
+    /* All-zero-weight reachable component: distances tie, so this stresses
+       the BMSSP tie handling; must terminate and stay exact. */
+    int n = 700;
+    SsortGraph *g = ssort_graph_new(n, 0);
+    for (int i = 1; i < n; i++) ssort_graph_add_edge(g, i - 1, i, 0.0);
+    for (int i = 0; i < 2 * n; i++) {
+        int u = rand() % n, v = rand() % n;
+        if (u != v) ssort_graph_add_edge(g, u, v, 0.0);
+    }
+    double *ds = malloc(sizeof(double) * n);
+    double *dd = malloc(sizeof(double) * n);
+    int *pred = malloc(sizeof(int) * n);
+    ssort(g, 0, ds, pred);
+    ref_dijkstra(g, 0, dd);
+    compare_all(g, ds, dd, dd);
+    for (int i = 0; i < n; i++) ASSERT(ds[i] == 0.0);
+    check_pred_path(g, 0, ds, pred);
+    free(ds); free(dd); free(pred);
+    ssort_graph_free(g);
+}
+
+TEST(test_bmssp_big_random) {
+    /* Random directed graph with varied weights, exercising the full BMSSP
+       recursion depth (n large enough for k>=2). */
+    int n = 5000;
+    SsortGraph *g = ssort_graph_new(n, 0);
+    srand(2024);
+    for (int i = 0; i < 5 * n; i++) {
+        int u = rand() % n, v = rand() % n;
+        if (u != v) {
+            int wm = rand() % 3;
+            double w = wm == 0 ? 0.0
+                     : wm == 1 ? (double)(rand() % 3)
+                     : (double)(rand() % 100000) / 100.0 + 0.01;
+            ssort_graph_add_edge(g, u, v, w);
+        }
+    }
+    double *ds = malloc(sizeof(double) * n);
+    double *dd = malloc(sizeof(double) * n);
+    int *pred = malloc(sizeof(int) * n);
+    ssort(g, 0, ds, pred);
+    ref_dijkstra(g, 0, dd);
+    compare_all(g, ds, dd, dd);
+    check_pred_path(g, 0, ds, pred);
+    free(ds); free(dd); free(pred);
+    ssort_graph_free(g);
+}
+
 /* ─── Main ───────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -360,6 +468,10 @@ int main(void) {
     RUN(test_cycle);
     RUN(test_dense_small);
     RUN(test_medium_random);
+    RUN(test_bmssp_chain2);
+    RUN(test_bmssp_shortcut);
+    RUN(test_bmssp_zero_weight);
+    RUN(test_bmssp_big_random);
     puts("all tests passed.");
     return 0;
 }
