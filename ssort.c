@@ -235,79 +235,337 @@ static int relax(State *s, int u, int v, double w) {
 }
 
 /* ─── Bounded monotone min-priority queue (Lemma 3.3) ────────────── */
-/* Array-based stand-in for the paper's block queue, kept sorted by value
-   so Pull always returns the M smallest labels. */
+/* Block-based bounded monotone min-priority queue following the paper:
+   values live in two block sequences, D0 (batch-prepends) and D1 (inserts);
+   each block holds at most M entries and the sequences stay sorted by value
+   so Pull always finds the M smallest labels. */
 
 typedef struct {
-    int    *keys;
-    double *vals;
-    int     n, cap;
-    double  B;
+    int    key;
+    double val;
+    int    prev, next;  /* doubly-linked entry list within a block */
+    int    blk;         /* block containing this entry */
+} DPEnt;
+
+typedef struct {
+    int    head, tail;  /* entry list */
+    int    len;
+    double upper;       /* max value in block (D1: for search) */
+    int    prev, next;  /* block doubly-linked list within its sequence */
+    int    seq;         /* 0 = D0, 1 = D1 */
+} DPBlock;
+
+typedef struct {
+    int      n, M;
+    double   B;
+    DPEnt   *ent;   int ent_cap, ent_next, ent_free;
+    DPBlock *blk;   int blk_cap, blk_next, blk_free;
+    int      d0h, d0t;   /* D0 head/tail */
+    int      d1h, d1t;   /* D1 head/tail */
+    int     *slot;        /* [n] entry id per vertex, -1 */
+    int     *tmp;         /* scratch for pull/split */
+    int      tmp_cap;
+    int      cnt;         /* live entries */
 } DPQ;
 
-static void dpq_init(DPQ *q, int cap, double B) {
-    q->keys = xmalloc(sizeof(int)    * (size_t)cap);
-    q->vals = xmalloc(sizeof(double) * (size_t)cap);
-    q->n = 0; q->cap = cap; q->B = B;
+/* ─── Pool helpers ──────────────────────────────────────────────── */
+
+static int blk_new(DPQ *q, int seq) {
+    int b;
+    if (q->blk_free >= 0) { b = q->blk_free; q->blk_free = q->blk[b].next; }
+    else {
+        if (q->blk_next >= q->blk_cap) {
+            q->blk_cap = q->blk_cap ? q->blk_cap * 2 : 8;
+            q->blk = xrealloc(q->blk, sizeof(DPBlock) * (size_t)q->blk_cap);
+        }
+        b = q->blk_next++;
+    }
+    q->blk[b] = (DPBlock){-1, -1, 0, 0.0, -1, -1, seq};
+    return b;
 }
 
-static void dpq_free(DPQ *q) { free(q->keys); free(q->vals); }
+static void blk_free(DPQ *q, int b) {
+    q->blk[b].next = q->blk_free; q->blk_free = b;
+}
 
-static int dpq_empty(DPQ *q) { return q->n == 0; }
+static int ent_new(DPQ *q, int key, double val) {
+    int e;
+    if (q->ent_free >= 0) { e = q->ent_free; q->ent_free = q->ent[e].next; }
+    else {
+        if (q->ent_next >= q->ent_cap) {
+            q->ent_cap = q->ent_cap ? q->ent_cap * 2 : 16;
+            if (q->ent_cap < q->n) q->ent_cap = imin(q->n, q->ent_cap);
+            q->ent = xrealloc(q->ent, sizeof(DPEnt) * (size_t)q->ent_cap);
+        }
+        e = q->ent_next++;
+    }
+    q->ent[e] = (DPEnt){key, val, -1, -1, -1};
+    q->slot[key] = e;
+    q->cnt++;
+    return e;
+}
 
-/* Insert (k, v), keeping ascending value order; a decrease-key bubbles the
-   updated entry up so the invariant never breaks. */
+static void ent_free(DPQ *q, int e) {
+    q->slot[q->ent[e].key] = -1;
+    q->ent[e].next = q->ent_free; q->ent_free = e;
+    q->cnt--;
+}
+
+/* ─── Block/sequence operations ──────────────────────────────────── */
+
+static void blk_append(DPQ *q, int b, int e) {
+    DPBlock *bl = &q->blk[b];
+    DPEnt   *en = &q->ent[e];
+    en->blk = b; en->prev = bl->tail; en->next = -1;
+    if (bl->tail >= 0) q->ent[bl->tail].next = e; else bl->head = e;
+    bl->tail = e; bl->len++;
+}
+
+static void blk_unlink_entry(DPQ *q, int e) {
+    DPEnt  *en  = &q->ent[e];
+    DPBlock *bl = &q->blk[en->blk];
+    if (en->prev >= 0) q->ent[en->prev].next = en->next; else bl->head = en->next;
+    if (en->next >= 0) q->ent[en->next].prev = en->prev; else bl->tail = en->prev;
+    bl->len--;
+}
+
+static void blk_remove_seq(DPQ *q, int b) {
+    DPBlock *bl = &q->blk[b];
+    if (bl->prev >= 0) q->blk[bl->prev].next = bl->next; else {
+        if (bl->seq == 0) q->d0h = bl->next; else q->d1h = bl->next;
+    }
+    if (bl->next >= 0) q->blk[bl->next].prev = bl->prev; else {
+        if (bl->seq == 0) q->d0t = bl->prev; else q->d1t = bl->prev;
+    }
+}
+
+static void seq_prepend(DPQ *q, int seq, int b) {
+    DPBlock *bl = &q->blk[b];
+    int *hp = (seq == 0) ? &q->d0h : &q->d1h;
+    int *tp = (seq == 0) ? &q->d0t : &q->d1t;
+    bl->prev = -1; bl->next = *hp;
+    if (*hp >= 0) q->blk[*hp].prev = b;
+    *hp = b;
+    if (*tp < 0) *tp = b;
+}
+
+static void seq_append(DPQ *q, int seq, int b) {
+    DPBlock *bl = &q->blk[b];
+    bl->next = -1; bl->prev = (seq == 0) ? q->d0t : q->d1t;
+    if (bl->prev >= 0) q->blk[bl->prev].next = b;
+    if (seq == 0) { q->d0t = b; if (q->d0h < 0) q->d0h = b; }
+    else          { q->d1t = b; if (q->d1h < 0) q->d1h = b; }
+}
+
+/* Insert block b after block a in the same sequence. If a < 0, prepend. */
+static void seq_insert_after(DPQ *q, int a, int b) {
+    DPBlock *bl = &q->blk[b];
+    if (a < 0) { seq_prepend(q, q->blk[b].seq, b); return; }
+    DPBlock *al = &q->blk[a];
+    bl->prev = a; bl->next = al->next;
+    if (al->next >= 0) q->blk[al->next].prev = b; else {
+        if (bl->seq == 0) q->d0t = b; else q->d1t = b;
+    }
+    al->next = b;
+}
+
+/* ─── D1 split ──────────────────────────────────────────────────── */
+
+static void blk_split(DPQ *q, int b) {
+    int n = q->blk[b].len;
+    /* collect entry ids */
+    if (n + 1 > q->tmp_cap) { q->tmp_cap = n + 16; q->tmp = xrealloc(q->tmp, sizeof(int) * (size_t)q->tmp_cap); }
+    int cnt = 0;
+    for (int e = q->blk[b].head; e >= 0; e = q->ent[e].next) q->tmp[cnt++] = e;
+    /* sort by (val, key) */
+    for (int i = 1; i < cnt; i++) {
+        int t = q->tmp[i]; double tv = q->ent[t].val; int tk = q->ent[t].key;
+        int j = i - 1;
+        while (j >= 0 && (q->ent[q->tmp[j]].val > tv ||
+               (q->ent[q->tmp[j]].val == tv && q->ent[q->tmp[j]].key > tk))) {
+            q->tmp[j + 1] = q->tmp[j]; j--;
+        }
+        q->tmp[j + 1] = t;
+    }
+    /* save block info before blk_new may realloc q->blk */
+    int bp   = q->blk[b].prev;
+    int bseq = q->blk[b].seq;
+    /* partition into two blocks */
+    int mid = cnt / 2;
+    int b1 = blk_new(q, bseq);
+    int b2 = blk_new(q, bseq);
+    /* link b1, b2 in place of b */
+    blk_remove_seq(q, b);
+    blk_free(q, b);
+    seq_insert_after(q, bp, b1);
+    seq_insert_after(q, b1, b2);
+    /* relink entries */
+    for (int i = 0; i < mid; i++) blk_append(q, b1, q->tmp[i]);
+    for (int i = mid; i < cnt; i++) blk_append(q, b2, q->tmp[i]);
+    /* set uppers */
+    q->blk[b1].upper = q->ent[q->tmp[mid - 1]].val;
+    q->blk[b2].upper = q->ent[q->tmp[cnt - 1]].val;
+}
+
+static void dpq_init(DPQ *q, int n, int M, double B) {
+    q->n = n; q->M = M; q->B = B;
+    q->ent = NULL; q->ent_cap = 0; q->ent_next = 0; q->ent_free = -1;
+    q->blk = NULL; q->blk_cap = 0; q->blk_next = 0; q->blk_free = -1;
+    q->d0h = q->d0t = -1;
+    q->d1h = q->d1t = -1;
+    q->slot = xmalloc(sizeof(int) * (size_t)n);
+    for (int i = 0; i < n; i++) q->slot[i] = -1;
+    q->tmp = NULL; q->tmp_cap = 0;
+    q->cnt = 0;
+    /* D1 starts with one empty block at upper B (paper's initialization). */
+    int b = blk_new(q, 1);
+    q->blk[b].upper = B;
+    seq_append(q, 1, b);
+}
+
+static void dpq_free(DPQ *q) {
+    free(q->ent); free(q->blk); free(q->slot); free(q->tmp);
+}
+
+static int dpq_empty(DPQ *q) { return q->cnt == 0; }
+
 static void dpq_insert(DPQ *q, int k, double v) {
-    for (int i = 0; i < q->n; i++) {
-        if (q->keys[i] == k) {
-            if (v < q->vals[i]) {
-                q->vals[i] = v;
-                while (i > 0 && q->vals[i - 1] > q->vals[i]) {
-                    int tk = q->keys[i - 1];
-                    double tv = q->vals[i - 1];
-                    q->keys[i - 1] = q->keys[i];
-                    q->vals[i - 1] = q->vals[i];
-                    q->keys[i] = tk;
-                    q->vals[i] = tv;
-                    i--;
-                }
+    int e = q->slot[k];
+    if (e >= 0) {
+        if (q->ent[e].val <= v) return;       /* no improvement */
+        blk_unlink_entry(q, e);               /* delete old */
+        if (q->blk[q->ent[e].blk].len == 0) {
+            blk_remove_seq(q, q->ent[e].blk);
+            blk_free(q, q->ent[e].blk);
+        }
+        ent_free(q, e);
+    }
+    /* walk D1 to find first block with upper >= v */
+    int b = -1;
+    for (int bi = q->d1h; bi >= 0; bi = q->blk[bi].next)
+        if (q->blk[bi].upper >= v) { b = bi; break; }
+    if (b < 0) {                          /* all uppers < v: new block at tail */
+        b = blk_new(q, 1);
+        q->blk[b].upper = q->B;
+        seq_append(q, 1, b);
+    }
+    int ne = ent_new(q, k, v);
+    blk_append(q, b, ne);
+    if (v > q->blk[b].upper) q->blk[b].upper = v;
+    if (q->blk[b].len > q->M) blk_split(q, b);
+}
+
+/* ─── BatchPrepend ──────────────────────────────────────────────── */
+
+typedef struct { int key; double val; } _BPBe;
+
+static int _bp_cmp_key(const void *a, const void *b) {
+    const _BPBe *pa = a, *pb = b;
+    if (pa->key != pb->key) return pa->key - pb->key;
+    return (pa->val > pb->val) - (pa->val < pb->val);
+}
+static int _bp_cmp_val(const void *a, const void *b) {
+    const _BPBe *pa = a, *pb = b;
+    if (pa->val != pb->val) return (pa->val > pb->val) - (pa->val < pb->val);
+    return pa->key - pb->key;
+}
+
+static void dpq_batch_prepend(DPQ *q, const int *kk, const double *kv, int len) {
+    if (len == 0) return;
+    /* 1. Delete any existing queue entry for each batch key (batch values
+          are all < Bi <= min value currently in the queue, so the batch
+          value is always an improvement). */
+    for (int i = 0; i < len; i++) {
+        int e = q->slot[kk[i]];
+        if (e >= 0) {
+            blk_unlink_entry(q, e);
+            if (q->blk[q->ent[e].blk].len == 0) {
+                blk_remove_seq(q, q->ent[e].blk);
+                blk_free(q, q->ent[e].blk);
             }
-            return;
+            ent_free(q, e);
         }
     }
-    if (q->n == q->cap) {
-        int nc = q->cap * 2;
-        q->keys = xrealloc(q->keys, sizeof(int)    * (size_t)nc);
-        q->vals = xrealloc(q->vals, sizeof(double) * (size_t)nc);
-        q->cap = nc;
+    /* 2. Dedup within batch: keep smallest value per key. */
+    _BPBe *tmp = xmalloc(sizeof(_BPBe) * (size_t)len);
+    for (int i = 0; i < len; i++) { tmp[i].key = kk[i]; tmp[i].val = kv[i]; }
+    qsort(tmp, (size_t)len, sizeof(_BPBe), _bp_cmp_key);
+    int m = 0;
+    for (int i = 0; i < len; i++)
+        if (i == 0 || tmp[i].key != tmp[i - 1].key) tmp[m++] = tmp[i];
+    /* 3. Sort survivors by (val, key). */
+    qsort(tmp, (size_t)m, sizeof(_BPBe), _bp_cmp_val);
+    /* 4. Chunk into blocks of ≤ M and prepend to D0. */
+    for (int i = 0; i < m; ) {
+        int b = blk_new(q, 0);
+        double mx = -1.0;
+        for (int j = 0; j < q->M && i < m; j++, i++) {
+            int e = ent_new(q, tmp[i].key, tmp[i].val);
+            blk_append(q, b, e);
+            if (tmp[i].val > mx) mx = tmp[i].val;
+        }
+        q->blk[b].upper = mx;
+        seq_prepend(q, 0, b);
     }
-    int i = q->n;
-    while (i > 0 && q->vals[i - 1] > v) {
-        q->keys[i] = q->keys[i - 1];
-        q->vals[i] = q->vals[i - 1];
-        i--;
-    }
-    q->keys[i] = k;
-    q->vals[i] = v;
-    q->n++;
+    free(tmp);
 }
 
-/* Pull the M smallest entries; *bound is the next label, or B if empty. */
+/* ─── Pull ───────────────────────────────────────────────────────── */
+
 static int dpq_pull(DPQ *q, int *ok, double *ov, int M, double *bound) {
-    int cnt = imin(M, q->n);
-    for (int i = 0; i < cnt; i++) {
-        ok[i] = q->keys[i];
-        ov[i] = q->vals[i];
+    if (q->cnt == 0) { *bound = q->B;     return 0;
+}
+
+    /* Collect prefix of blocks from D0 and D1 into tmp[]. */
+    int need = imin(M, q->cnt);
+    int cap = need * 2 + 8;
+    if (cap > q->tmp_cap) { q->tmp_cap = cap; q->tmp = xrealloc(q->tmp, sizeof(int) * (size_t)q->tmp_cap); }
+    int n = 0;
+    /* D0 prefix */
+    for (int bi = q->d0h; bi >= 0 && n < need; bi = q->blk[bi].next)
+        for (int e = q->blk[bi].head; e >= 0; e = q->ent[e].next) q->tmp[n++] = e;
+    /* D1 prefix */
+    for (int bi = q->d1h; bi >= 0 && n < need; bi = q->blk[bi].next)
+        for (int e = q->blk[bi].head; e >= 0; e = q->ent[e].next) q->tmp[n++] = e;
+    /* Select the M smallest among collected (insertion sort, M ≤ n ≤ 2M). */
+    /* Use a comparator that reads values from the entry pool. */
+    for (int i = 1; i < n; i++) {
+        int t = q->tmp[i]; double tv = q->ent[t].val; int tk = q->ent[t].key;
+        int j = i - 1;
+        while (j >= 0 && (q->ent[q->tmp[j]].val > tv ||
+               (q->ent[q->tmp[j]].val == tv && q->ent[q->tmp[j]].key > tk))) {
+            q->tmp[j + 1] = q->tmp[j]; j--;
+        }
+        q->tmp[j + 1] = t;
     }
-    int rem = q->n - cnt;
-    memmove(q->keys, q->keys + cnt, sizeof(int)    * (size_t)rem);
-    memmove(q->vals, q->vals + cnt, sizeof(double) * (size_t)rem);
-    q->n = rem;
-    *bound = (rem > 0) ? q->vals[0] : q->B;
+    int cnt = imin(M, n);
+    /* Return selected entries and delete them. */
+    for (int i = 0; i < cnt; i++) {
+        int e = q->tmp[i];
+        ok[i] = q->ent[e].key;
+        ov[i] = q->ent[e].val;
+    }
+    for (int i = 0; i < cnt; i++) {
+        int e = q->tmp[i];
+        int b = q->ent[e].blk;
+        blk_unlink_entry(q, e);
+        if (q->blk[b].len == 0) { blk_remove_seq(q, b); blk_free(q, b); }
+        ent_free(q, e);
+    }
+    /* Compute bound: smallest remaining value, or B if empty. */
+    if (q->cnt == 0) { *bound = q->B; return cnt; }
+    double mn = q->B;
+    for (int bi = q->d0h; bi >= 0; bi = q->blk[bi].next)
+        for (int e = q->blk[bi].head; e >= 0; e = q->ent[e].next)
+            if (q->ent[e].val < mn) mn = q->ent[e].val;
+    for (int bi = q->d1h; bi >= 0; bi = q->blk[bi].next)
+        for (int e = q->blk[bi].head; e >= 0; e = q->ent[e].next)
+            if (q->ent[e].val < mn) mn = q->ent[e].val;
+    *bound = mn;
     return cnt;
 }
 
-/* ─── FindPivots (Algorithm 1) ──────────────────────────────────── */
+/* ─── FindPivots ────────────────────────────────────────────────── */
 
 static void find_pivots(State *s, double B,
                         const int *S, int Slen,
@@ -434,7 +692,7 @@ static void find_pivots(State *s, double B,
     free(sz); free(sp); free(cursor);
 }
 
-/* ─── Base Case (Algorithm 2) ────────────────────────────────────── */
+/* ─── Base Case ──────────────────────────────────────────────────── */
 
 static void base_case(State *s, double B, const int *S, int Slen,
                       double *Bp, IVec *U) {
@@ -489,7 +747,7 @@ static void base_case(State *s, double B, const int *S, int Slen,
     heap_free(&h);
 }
 
-/* ─── BMSSP (Algorithm 3) ────────────────────────────────────────── */
+/* ─── BMSSP ──────────────────────────────────────────────────────── */
 
 static void bmssp(State *s, int l, double B,
                   const int *S, int Slen,
@@ -516,7 +774,7 @@ static void bmssp_recurse(State *s, int l, double B,
     find_pivots(s, B, S, Slen, P, &Plen, W, &Wlen);
 
     DPQ D;
-    dpq_init(&D, n, B);
+    dpq_init(&D, n, M, B);
     for (int i = 0; i < Plen; i++)
         dpq_insert(&D, P[i], s->d[P[i]]);
 
@@ -584,8 +842,7 @@ static void bmssp_recurse(State *s, int l, double B,
                 Kk[Klen] = Si[i]; Kv[Klen] = Siv[i]; Klen++;
             }
         }
-        for (int i = 0; i < Klen; i++)
-            dpq_insert(&D, Kk[i], Kv[i]);
+        dpq_batch_prepend(&D, Kk, Kv, Klen);
 
         ivec_free(&Ui);
     }
@@ -716,3 +973,81 @@ int ssort(const SsortGraph *g, int src, double *dist, int *pred) {
     csr_free(&csr);
     return 0;
 }
+
+/* ─── DPQ unit test (internal) ──────────────────────────────────── */
+
+int ssort_dpq_test(void) {
+    int n = 20, M = 4;
+    double B = 100.0;
+    DPQ q;
+    dpq_init(&q, n, M, B);
+
+    /* batch_prepend several values, pull should return them sorted ascending */
+    int Kk[6] = {10, 5, 15, 3, 8, 12};
+    double Kv[6] = {10.0, 5.0, 15.0, 3.0, 8.0, 12.0};
+    dpq_batch_prepend(&q, Kk, Kv, 6);
+    if (q.cnt != 6) return 1;
+
+    double prev = -1.0;
+    int total_pulled = 0;
+    while (q.cnt > 0) {
+        int pk[8]; double pv[8]; double pb;
+        int cnt = dpq_pull(&q, pk, pv, M, &pb);
+        if (cnt == 0) return 2;
+        for (int i = 0; i < cnt; i++) {
+            if (pv[i] < prev - 1e-12) return 3;
+            prev = pv[i];
+            total_pulled++;
+        }
+    }
+    if (total_pulled != 6) return 4;
+
+    /* insert with decrease-key */
+    dpq_free(&q);
+    dpq_init(&q, n, M, B);
+    dpq_insert(&q, 0, 50.0);
+    dpq_insert(&q, 1, 30.0);
+    dpq_insert(&q, 2, 40.0);
+    if (q.cnt != 3) return 5;
+
+    dpq_insert(&q, 2, 20.0);
+    if (q.cnt != 3) return 6;
+
+    {
+        int pk[8]; double pv[8]; double pb;
+        int cnt = dpq_pull(&q, pk, pv, M, &pb);
+        if (cnt < 1 || pk[0] != 2 || pv[0] > 20.0 + 1e-12) return 7;
+    }
+
+    /* batch_prepend + insert interleaving */
+    dpq_free(&q);
+    dpq_init(&q, n, M, B);
+    int K2k[3] = {0, 1, 2};
+    double K2v[3] = {5.0, 3.0, 7.0};
+    dpq_batch_prepend(&q, K2k, K2v, 3);
+    dpq_insert(&q, 3, 4.0);
+    if (q.cnt != 4) return 8;
+
+    {
+        int pk[8]; double pv[8]; double pb;
+        int cnt = dpq_pull(&q, pk, pv, M, &pb);
+        if (cnt < 1 || pk[0] != 1 || pv[0] > 3.0 + 1e-12) return 9;
+    }
+
+    /* pull bound should be correct */
+    dpq_free(&q);
+    dpq_init(&q, n, M, B);
+    int K3k[5] = {0, 1, 2, 3, 4};
+    double K3v[5] = {10.0, 20.0, 30.0, 40.0, 50.0};
+    dpq_batch_prepend(&q, K3k, K3v, 5);
+    {
+        int pk[8]; double pv[8]; double pb;
+        dpq_pull(&q, pk, pv, M, &pb);
+        if (pb > 50.0 + 1e-12) return 10;
+    }
+
+    dpq_free(&q);
+    return 0;
+}
+
+

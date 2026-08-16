@@ -454,6 +454,12 @@ TEST(test_bmssp_big_random) {
 
 /* ─── Main ───────────────────────────────────────────────────────── */
 
+extern int ssort_dpq_test(void);
+
+static void test_dpq_unit(void) {
+    ASSERT(ssort_dpq_test() == 0);
+}
+
 int main(void) {
     puts("ssort tests:");
     RUN(test_single_vertex);
@@ -472,6 +478,7 @@ int main(void) {
     RUN(test_bmssp_shortcut);
     RUN(test_bmssp_zero_weight);
     RUN(test_bmssp_big_random);
+    RUN(test_dpq_unit);
     puts("all tests passed.");
     return 0;
 }
