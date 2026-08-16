@@ -1,4 +1,4 @@
-/* test_ssort.c — hand-written tests with Dijkstra and Bellman-Ford oracles. */
+/* test_ssort.c - hand-written tests with Dijkstra and Bellman-Ford oracles. */
 
 #include "ssort.h"
 #include <assert.h>
@@ -22,7 +22,7 @@
         }                                                                     \
     } while (0)
 
-/* ─── Local CSR for reference implementations ───────────────────── */
+/* --- Local CSR for reference implementations ----------------------- */
 
 typedef struct {
     int n, m;
@@ -49,7 +49,7 @@ static void lcsr_build(LCSR *c, const SsortGraph *g) {
 
 static void lcsr_free(LCSR *c) { free(c->off); free(c->adj); free(c->wgt); }
 
-/* ─── Reference: Dijkstra (binary heap) ──────────────────────────── */
+/* --- Reference: Dijkstra (binary heap) ------------------------------ */
 
 typedef struct {
     int    *keys;
@@ -122,7 +122,7 @@ static void ref_dijkstra(const SsortGraph *g, int src, double *dist) {
     rh_free(&h); lcsr_free(&c);
 }
 
-/* ─── Reference: Bellman-Ford ────────────────────────────────────── */
+/* --- Reference: Bellman-Ford ----------------------------------------- */
 
 static void ref_bellman_ford(const SsortGraph *g, int src, double *dist) {
     LCSR c; lcsr_build(&c, g);
@@ -142,7 +142,7 @@ static void ref_bellman_ford(const SsortGraph *g, int src, double *dist) {
     lcsr_free(&c);
 }
 
-/* ─── Helpers ────────────────────────────────────────────────────── */
+/* --- Helpers ----------------------------------------------------------- */
 
 static void compare_all(const SsortGraph *g,
                         const double *ds, const double *dd, const double *db) {
@@ -160,7 +160,7 @@ static void compare_all(const SsortGraph *g,
     }
 }
 
-/* ─── Tests ──────────────────────────────────────────────────────── */
+/* --- Tests -------------------------------------------------------------- */
 
 TEST(test_single_vertex) {
     SsortGraph *g = ssort_graph_new(1, 0);
@@ -344,7 +344,7 @@ TEST(test_medium_random) {
     ssort_graph_free(g);
 }
 
-/* ─── BMSSP-path tests (n >= 256 exercises the n>=256 algorithm) ── */
+/* --- BMSSP-path tests (n >= 256 exercises the n>=256 algorithm) ---- */
 
 static void check_pred_path(const SsortGraph *g, int src, const double *ds,
                             const int *pred) {
@@ -452,7 +452,7 @@ TEST(test_bmssp_big_random) {
     ssort_graph_free(g);
 }
 
-/* ─── Main ───────────────────────────────────────────────────────── */
+/* --- Main ---------------------------------------------------------------- */
 
 extern int ssort_dpq_test(void);
 

@@ -1,4 +1,7 @@
 *.o
 *.a
 test_ssort
+test_asan
+fuzz
+fuzz_asan
 .zig-cache/

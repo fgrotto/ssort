@@ -1,28 +1,13 @@
 # ssort
 
 Single-source shortest paths (SSSP) for directed graphs with non-negative
-real edge weights, running in O(m log^{2/3} n) expected time.
+real edge weights.
 
-Implementation of the algorithm from:
+Implementation based on the algorithm from:
 
 > R. Duan, J. Mao, X. Mao, X. Shu, L. Yin.
 > *Breaking the Sorting Barrier for Directed Single-Source Shortest Paths.*
 > STOC 2025. [arXiv:2504.17033](https://arxiv.org/abs/2504.17033)
-
-## How it works
-
-For graphs with fewer than 256 vertices `ssort()` runs plain Dijkstra.
-For larger graphs it runs the paper's BMSSP as a *warm start* followed by an
-exact multi-source Dijkstra pass seeded with the labels BMSSP produced.
-
-BMSSP only ever sets labels that are valid upper bounds on the true
-distance, so the final exact pass always returns correct distances and
-predecessors regardless of BMSSP internals. The recursion levels and pull
-sizes are parameterized as in the paper: k = log^{1/3} n, t = log^{2/3} n,
-with saturated 64-bit bookkeeping so the paper's 2^{lt} bounds never
-overflow on realistic inputs.
-
-Space usage is O(n + m).
 
 ## Build
 
@@ -58,11 +43,11 @@ Distances are checked against two independent oracles:
 - Bellman-Ford (also catches negative-weight or float artifacts on small
   graphs).
 
-The test suite forces the BMSSP code path (n >= 256) with deep chains,
-shortcut graphs, and all-zero-weight tie graphs. `make fuzz` runs a
-differential fuzzer over random graphs (up to a few thousand vertices)
-comparing against both oracles, and `make asan` repeats part of that under
-AddressSanitizer and UndefinedBehaviorSanitizer.
+The test suite forces the BMSSP code path with deep chains, shortcut
+graphs, all-zero-weight tie graphs, and graphs with self-loops and parallel
+edges. `make fuzz` runs a differential fuzzer over random graphs (up to a
+few thousand vertices) comparing against both oracles, and `make asan`
+repeats part of that under AddressSanitizer and UndefinedBehaviorSanitizer.
 
 ## License
 
